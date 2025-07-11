@@ -40,7 +40,7 @@ All hyperparameters used for the experiments in the paper are located in the [`c
 To specify the experiment to run use `--config_path` flag, for example:
 
 ```bash
-python -m mfm.train.main --config_path ./config/arch/ot-mfm.yaml
+python -m mfm.train.main --config_path ./configs/arch/ot-mfm.yaml
 ```
 
 
