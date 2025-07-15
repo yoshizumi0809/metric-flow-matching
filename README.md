@@ -1,4 +1,4 @@
-# Metric Flow Matching for Smooth Interpolations on the Data Manifold
+# [Metric Flow Matching for Smooth Interpolations on the Data Manifold](https://arxiv.org/abs/2405.14780)
 
 <div align="center">
 
