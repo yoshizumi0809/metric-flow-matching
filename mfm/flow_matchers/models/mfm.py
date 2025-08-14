@@ -1,5 +1,7 @@
 import torch
 from torchcfm.conditional_flow_matching import ConditionalFlowMatcher, pad_t_like_x
+from torch.func import jvp  
+
 
 
 class MetricFlowMatcher(ConditionalFlowMatcher):
@@ -34,13 +36,7 @@ class MetricFlowMatcher(ConditionalFlowMatcher):
                 ) * x1
             self.geopath_net_output = self.geopath_net(x0, x1, t)
             if self.geopath_net.time_geopath:
-                self.doutput_dt = torch.autograd.grad(
-                    self.geopath_net_output,
-                    t,
-                    grad_outputs=torch.ones_like(self.geopath_net_output),
-                    create_graph=False,
-                    retain_graph=True,
-                )[0]
+                self.doutput_dt = self.doutput_dt_fun(self.geopath_net, x0, x1, t)
         return (
             (t_max - t) / (t_max - t_min) * x0
             + (t - t_min) / (t_max - t_min) * x1
@@ -94,3 +90,12 @@ class MetricFlowMatcher(ConditionalFlowMatcher):
                 else 0
             )
         )
+    
+    @staticmethod
+    def doutput_dt_fun(model, x0, x1, t_raw):
+        def f(tt):
+            t_padded = pad_t_like_x(tt, x0)        
+            return model(x0, x1, t_padded)
+
+        _, dydt = jvp(f, (t_raw,), (torch.ones_like(t_raw),))
+        return dydt.squeeze(-1)      
