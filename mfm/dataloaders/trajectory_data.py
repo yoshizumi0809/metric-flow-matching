@@ -260,3 +260,4 @@ def generate_sphere_data(num_points: int = 5000):
 
     unique_labels = np.unique(labels)
     return points, labels, unique_labels
+#test
