@@ -1,7 +1,6 @@
 import torch
 import pytorch_lightning as pl
 
-
 from mfm.flow_matchers.ema import EMA
 
 
@@ -64,7 +63,7 @@ class GeoPathNetTrain(pl.LightningModule):
                     batch[0]["train_samples"][0],
                     batch[0]["metric_samples"][0],
                 )
-                total_loss += loss.item()
+                total_loss += float(loss)
                 total_count += 1
             self.flow_matcher.alpha = old_alpha
         self.computing_reference_loss = False
@@ -82,13 +81,15 @@ class GeoPathNetTrain(pl.LightningModule):
             for i, x in enumerate(metric_samples_batch)
             if i not in self.skipped_time_points
         ]
+
         x0s, x1s = main_batch_filtered[:-1], main_batch_filtered[1:]
         samples0, samples1 = (
             metric_samples_batch_filtered[:-1],
             metric_samples_batch_filtered[1:],
         )
+
         ts, xts, uts = self._process_flow(x0s, x1s)
-        loss = 0
+
         velocities = []
         for i in range(len(ts)):
             samples = torch.cat([samples0[i], samples1[i]], dim=0)
@@ -96,6 +97,18 @@ class GeoPathNetTrain(pl.LightningModule):
                 xts[i], uts[i], samples, i
             )
             velocities.append(vel)
+
+        if len(velocities) == 0:
+            # すべて重複で全スキップになったケースでも安全に動作
+            self.log(
+                "GeoPathNet/all_pairs_skipped",
+                1.0,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+            )
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
         loss = torch.mean(torch.cat(velocities) ** 2)
         self.log(
             "GeoPathNet/mean_velocity_geopath",
@@ -104,16 +117,27 @@ class GeoPathNetTrain(pl.LightningModule):
             on_epoch=True,
             prog_bar=True,
         )
-
         return loss
+
+    @staticmethod
+    def _equal_mask(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
+        """サンプル次元以外が完全一致しているかのマスク"""
+        # 形状: (B, ...)
+        reduce_dims = tuple(range(1, x0.ndim))
+        if x0.dtype.is_floating_point:
+            # 完全一致のみを重複と見なす（数値誤差での誤検出を避ける）
+            diff = (x0 - x1).abs()
+            return (diff.amax(dim=reduce_dims) == 0)
+        else:
+            return (x0 == x1).all(dim=reduce_dims)
 
     def _process_flow(self, x0s, x1s):
         ts, xts, uts = [], [], []
         t_start = self.timesteps[0]
-        i_start = 0
 
         for i, (x0, x1) in enumerate(zip(x0s, x1s)):
             x0, x1 = torch.squeeze(x0), torch.squeeze(x1)
+
             if self.trainer.validating or self.computing_reference_loss:
                 repeat_tuple = (self.multiply_validation, 1) + (1,) * (
                     len(x0.shape) - 2
@@ -122,11 +146,47 @@ class GeoPathNetTrain(pl.LightningModule):
                 x1 = x1.repeat(repeat_tuple)
 
             if self.ot_sampler is not None:
-                x0, x1 = self.ot_sampler.sample_plan(
-                    x0,
-                    x1,
-                    replace=True,
-                )
+                x0, x1 = self.ot_sampler.sample_plan(x0, x1, replace=True)
+
+            # --- 重複除外 & フォールバック再ペアリング ---
+            same_mask = self._equal_mask(x0, x1)
+            keep_mask = ~same_mask
+            dup_ratio = same_mask.float().mean().item()
+            self.log(
+                "GeoPathNet/dup_ratio_in_pair",
+                dup_ratio,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+            )
+
+            if keep_mask.sum().item() == 0:
+                # すべて重複 → x1 をランダムにシャッフルして再ペア
+                if x1.shape[0] > 1:
+                    perm = torch.randperm(x1.shape[0], device=x1.device)
+                    x1_shuf = x1[perm]
+                    same_mask = self._equal_mask(x0, x1_shuf)
+                    keep_mask = ~same_mask
+                    if keep_mask.sum().item() > 0:
+                        x1 = x1_shuf
+                    else:
+                        # それでも全重複ならこのタイムスライスはスキップ
+                        if self.skipped_time_points and i + 1 >= self.skipped_time_points[0]:
+                            t_start = self.timesteps[i + 2]
+                        else:
+                            t_start = self.timesteps[i + 1]
+                        continue
+                else:
+                    # バッチサイズ1でどうにもならない
+                    if self.skipped_time_points and i + 1 >= self.skipped_time_points[0]:
+                        t_start = self.timesteps[i + 2]
+                    else:
+                        t_start = self.timesteps[i + 1]
+                    continue
+
+            x0 = x0[keep_mask]
+            x1 = x1[keep_mask]
+
             if self.skipped_time_points and i + 1 >= self.skipped_time_points[0]:
                 t_start_next = self.timesteps[i + 2]
             else:
@@ -135,6 +195,8 @@ class GeoPathNetTrain(pl.LightningModule):
             t = None
             if self.trainer.validating or self.computing_reference_loss:
                 t = self.t_val[i]
+                if t.shape[0] != x0.shape[0]:
+                    t = t[: x0.shape[0]]
 
             t, xt, ut = self.flow_matcher.sample_location_and_conditional_flow(
                 x0, x1, t_start, t_start_next, training_geopath_net=True, t=t
@@ -192,10 +254,7 @@ class GeoPathNetTrain(pl.LightningModule):
 
     def configure_optimizers(self):
         if self.optimizer_name == "adam":
-            optimizer = torch.optim.Adam(
-                self.geopath_net.parameters(),
-                lr=self.lr,
-            )
+            optimizer = torch.optim.Adam(self.geopath_net.parameters(), lr=self.lr)
         elif self.optimizer_name == "adamw":
             optimizer = torch.optim.AdamW(
                 self.geopath_net.parameters(),

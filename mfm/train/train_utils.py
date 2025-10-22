@@ -2,6 +2,7 @@ import yaml
 import string
 import secrets
 import os
+from datetime import datetime
 
 import torch
 import wandb
@@ -50,53 +51,109 @@ def dataset_name2datapath(dataset_name, working_dir):
         raise ValueError("Dataset not recognized")
 
 
-def create_callbacks(args, phase, data_type, run_id, datamodule=None):
+# ============== ここから新規: 保存名をわかりやすく揃えるユーティリティ ==============
+def _exp_tag(args, phase, data_type):
+    """ログ／保存名に使う実験タグ（x0->x1, seed含む）"""
+    x0 = getattr(args, "x0_label", "x0")
+    x1 = getattr(args, "x1_label", "x1")
+    seed = getattr(args, "seed_current", getattr(args, "seed", None))
+    seed_str = f"seed{seed}" if seed is not None else "seedNA"
+    return f"{data_type}_{phase}_{x0}_to_{x1}_{seed_str}"
 
-    dirpath = os.path.join(
-        args.working_dir,
-        "checkpoints",
-        data_type,
-        str(run_id),
-        f"{phase}_model",
-    )
+
+def _ckpt_dir(args, phase, data_type, run_id=None):
+    """チェックポイントの保存ディレクトリを一意で分かりやすく"""
+    tag = _exp_tag(args, phase, data_type)
+    # run_id を付けたいときは付ける（W&Bとの対応に便利）
+    rid = f"run-{run_id}" if run_id else f"ts-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    path = os.path.join(args.working_dir, "checkpoints", data_type, tag, rid)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _filename_pattern(monitor_name: str | None, phase: str, args) -> str:
+    """保存ファイル名のパターン（monitor があれば値も付ける）"""
+    tag = _exp_tag(args, phase, args.data_type)
+    if monitor_name:
+        # '/' はファイル名に使えないので '_' に
+        mon = monitor_name.replace("/", "_")
+        return f"{tag}-{{epoch:03d}}-{{{mon}:.5f}}"
+    else:
+        return f"{tag}-{{epoch:03d}}"
+# ============================================================================
+
+
+def create_callbacks(args, phase, data_type, run_id, datamodule=None):
+    """
+    ▷ 変更点
+      - 保存先: <working_dir>/checkpoints/<data_type>/<data_type>_<phase>_<x0>_to_<x1>_seed*/run-<wandb_id>/
+      - すべて save_last=True を有効化（途中中断しても last.ckpt が残る）
+      - 監視指標をフェーズごとに明示（Flow: FlowNet/val_loss_cfm, GeoPath: GeoPathNet/val_loss_geopath）
+      - ファイル名に metric 値 or epoch を含める
+    """
+    # 監視するメトリクス名をフェーズごとに定義
+    if phase == "geopath":
+        monitor = "GeoPathNet/val_loss_geopath"
+        mode = "min"
+    elif phase == "flow":
+        monitor = "FlowNet/val_loss_cfm"
+        mode = "min"
+    else:
+        raise ValueError("Unknown phase")
+
+    dirpath = _ckpt_dir(args, phase, data_type, run_id=run_id)
+    filename = _filename_pattern(monitor, phase, args)
+
+    callbacks = []
 
     if phase == "geopath":
         early_stop_callback = EarlyStopping(
-            monitor="GeoPathNet/val_loss_geopath",
+            monitor=monitor,
             patience=args.patience_geopath,
-            mode="min",
+            mode=mode,
         )
         checkpoint_callback = ModelCheckpoint(
             dirpath=dirpath,
-            monitor="GeoPathNet/val_loss_geopath",
-            mode="min",
-            save_top_k=1,
+            filename=filename,
+            monitor=monitor,
+            mode=mode,
+            save_top_k=3,      # 上位3つ
+            save_last=True,    # ★重要
+            every_n_epochs=1,
+            auto_insert_metric_name=False,
         )
         callbacks = [checkpoint_callback, early_stop_callback]
+
     elif phase == "flow":
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=dirpath,
+            filename=filename,
+            monitor=monitor,
+            mode=mode,
+            save_top_k=3,
+            save_last=True,      # ★重要
+            every_n_epochs=max(1, int(getattr(args, "check_val_every_n_epoch", 1))),
+            auto_insert_metric_name=False,
+        )
+        callbacks.append(checkpoint_callback)
+
+        # 可視化コールバック（画像タスクのみ）
         if args.data_type == "image":
-            checkpoint_callback = ModelCheckpoint(
-                dirpath=dirpath,
-                every_n_epochs=args.check_val_every_n_epoch,
-            )
             plotting_callback = PlottingCallback(
-                plot_interval=args.check_val_every_n_epoch, datamodule=datamodule
+                plot_interval=max(1, int(getattr(args, "check_val_every_n_epoch", 1))),
+                datamodule=datamodule,
             )
-            callbacks = [checkpoint_callback, plotting_callback]
-        else:
+            callbacks.append(plotting_callback)
+
+        # 早期終了（任意）
+        if getattr(args, "patience", None):
             early_stop_callback = EarlyStopping(
-                monitor="FlowNet/val_loss_cfm",
+                monitor=monitor,
                 patience=args.patience,
-                mode="min",
+                mode=mode,
             )
-            checkpoint_callback = ModelCheckpoint(
-                dirpath=dirpath,
-                mode="min",
-                save_top_k=1,
-            )
-            callbacks = [checkpoint_callback, early_stop_callback]
-    else:
-        raise ValueError("Unknown phase")
+            callbacks.append(early_stop_callback)
+
     return callbacks
 
 

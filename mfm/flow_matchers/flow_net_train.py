@@ -1,3 +1,5 @@
+# mfm/flow_matchers/flow_net_train.py
+
 import os
 import torch
 import wandb
@@ -7,11 +9,11 @@ from torch.optim import AdamW
 from torchmetrics.functional import mean_squared_error
 from torchdyn.core import NeuralODE
 from torchvision import transforms
+from torchvision.utils import save_image  # 画像保存
 
 import lpips
 from fld.features.InceptionFeatureExtractor import InceptionFeatureExtractor
 from fld.metrics.FID import FID
-
 
 from mfm.networks.utils import flow_model_torch_wrapper
 from mfm.utils import wasserstein_distance, plot_arch, plot_lidar, plot_sphere
@@ -40,6 +42,9 @@ class FlowNetTrainBase(pl.LightningModule):
         self.whiten = args.whiten
         self.working_dir = args.working_dir
 
+        # ★ 追加: 実験名タグ作成などで使う
+        self.args = args
+
     def forward(self, t, xt):
         return self.flow_net(t, xt)
 
@@ -47,7 +52,6 @@ class FlowNetTrainBase(pl.LightningModule):
         main_batch_filtered = [
             x for i, x in enumerate(main_batch) if i not in self.skipped_time_points
         ]
-
         x0s, x1s = main_batch_filtered[:-1], main_batch_filtered[1:]
         ts, xts, uts = self._process_flow(x0s, x1s)
 
@@ -57,7 +61,6 @@ class FlowNetTrainBase(pl.LightningModule):
         vt = self(t[:, None], xt)
 
         loss = mean_squared_error(vt, ut)
-
         return loss
 
     def _process_flow(self, x0s, x1s):
@@ -83,7 +86,6 @@ class FlowNetTrainBase(pl.LightningModule):
             )
 
             ts.append(t)
-
             xts.append(xt)
             uts.append(ut)
             t_start = t_start_next
@@ -114,7 +116,6 @@ class FlowNetTrainBase(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         main_batch = batch["val_samples"][0]
-
         self.timesteps = torch.linspace(0.0, 1.0, len(main_batch)).tolist()
         val_loss = self._compute_loss(main_batch)
         self.log(
@@ -144,7 +145,6 @@ class FlowNetTrainBase(pl.LightningModule):
                 self.parameters(),
                 lr=self.lr,
             )
-
         return optimizer
 
 
@@ -205,7 +205,6 @@ class FlowNetTrainTrajectory(FlowNetTrainBase):
 
             EMD = wasserstein_distance(X_mid_pred, batch[t_exclude], p=1)
             self.final_EMD = EMD
-
             self.log("test_EMD", EMD, on_step=False, on_epoch=True, prog_bar=True)
 
 
@@ -247,6 +246,7 @@ class FlowNetTrainLidar(FlowNetTrainBase):
 
 class FlowNetTrainImage(FlowNetTrainBase):
     def on_test_start(self):
+        # ODE 準備
         self.node = NeuralODE(
             flow_model_torch_wrapper(self.flow_net).to(self.device),
             solver="tsit5",
@@ -255,6 +255,8 @@ class FlowNetTrainImage(FlowNetTrainBase):
             rtol=1e-5,
         )
         self.all_outputs = []
+
+        # VAE / 後処理
         self.vae = self.trainer.datamodule.vae.to(self.device)
         self.postprocess = self.trainer.datamodule.process.postprocess
         image_size = self.trainer.datamodule.image_size
@@ -263,7 +265,29 @@ class FlowNetTrainImage(FlowNetTrainBase):
         )
         self.ambient_x1 = self.trainer.datamodule.ambient_x1
 
+        # ===== 保存ディレクトリ: generated_samples/<experiment_name> に固定 =====
+        exp_name = getattr(self.args, "experiment_name", None)
+        if not exp_name or len(str(exp_name)) == 0:
+            # experiment_name が無いときだけフォールバックで旧タグを使う
+            seed = getattr(self.args, "seed_current", None)
+            if seed is None and getattr(self.args, "seeds", None):
+                seed = self.args.seeds[0]
+            seed_str = f"seed{seed}" if seed is not None else "seedNA"
+            data_type = getattr(self.trainer.datamodule, "data_type", "image")
+            exp_name = f"{data_type}_{self.args.x0_label}_to_{self.args.x1_label}_{seed_str}"
+
+        base_dir = os.path.join(self.working_dir, "generated_samples")
+        self.sample_dir = os.path.join(base_dir, exp_name)
+        if self.global_rank == 0:
+            os.makedirs(self.sample_dir, exist_ok=True)
+            self.print(f"[FlowNetTest] Saving samples to: {self.sample_dir}")
+
+    def _to_01(self, x_minus1_to_1: torch.Tensor) -> torch.Tensor:
+        """[-1,1] -> [0,1]"""
+        return (x_minus1_to_1.clamp(-1, 1) + 1.0) * 0.5
+
     def test_step(self, batch, batch_idx):
+        # ===== 生成 =====
         with torch.no_grad():
             traj = self.node.trajectory(
                 batch.to(self.device),
@@ -271,19 +295,59 @@ class FlowNetTrainImage(FlowNetTrainBase):
             )
         traj = traj.transpose(0, 1)
         traj = traj.reshape(*traj.shape[0:2], *self.trainer.datamodule.dim)
-        output = traj[:, -1]
-        output = self.vae.decode(output).sample.cpu().detach()
+        output_latent = traj[:, -1]
+
+        # VAE で画像に復元（CPUへ）
+        output = self.vae.decode(output_latent).sample.cpu().detach()
         self.all_outputs.append(output)
 
+        # ===== 保存（rank 0 のみ）=====
+        if self.global_rank == 0:
+            imgs_01 = self._to_01(output)  # [-1,1] → [0,1]
+
+            # 個別PNG（従来名に回帰）
+            for i in range(imgs_01.size(0)):
+                fname = f"sample_b{batch_idx:04d}_{i:03d}.png"
+                save_image(imgs_01[i], os.path.join(self.sample_dir, fname))
+
+            # グリッドPNG（従来名に回帰）
+            grid_name = f"grid_b{batch_idx:04d}.png"
+            save_image(imgs_01, os.path.join(self.sample_dir, grid_name), nrow=min(8, imgs_01.size(0)))
+
     def on_test_epoch_end(self):
-        all_outputs = torch.cat(self.all_outputs, dim=0).to(self.device)
+        # ===== 評価 =====
+        all_outputs = torch.cat(self.all_outputs, dim=0).cpu()
+        x1_cpu = self.ambient_x1[: all_outputs.size(0)].cpu()
+        x0_cpu = self.ambient_x0[: all_outputs.size(0)].cpu()
+
         fid = self.compute_fid(
-            FIDImageDataset(self.ambient_x1, self.postprocess),
+            FIDImageDataset(x1_cpu, self.postprocess),
             FIDImageDataset(all_outputs, self.postprocess),
         )
-        lpips = self.compute_lpips(self.ambient_x0, all_outputs)
+        lpips_val = self.compute_lpips(self._prep_for_lpips(x0_cpu), self._prep_for_lpips(all_outputs))
+
         self.log("FID", fid, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("LPIPS", lpips, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("LPIPS", lpips_val, on_step=False, on_epoch=True, prog_bar=True)
+
+        # ===== まとめて保存（rank 0 のみ、従来名に回帰）=====
+        if self.global_rank == 0:
+            imgs_01_all = self._to_01(all_outputs)
+            save_image(imgs_01_all, os.path.join(self.sample_dir, "samples_all_grid.png"), nrow=8)
+            torch.save(all_outputs, os.path.join(self.sample_dir, "samples_all.pt"))
+
+    def _prep_for_lpips(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.float()
+        x_min, x_max = float(x.min()), float(x.max())
+        if x_max > 1.0 or x_min < 0.0:
+            x = x / 255.0
+        x = x * 2.0 - 1.0
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        elif x.shape[1] != 3:
+            x = x[:, :3, ...]
+        return x
 
     def compute_lpips(self, x0_data, gen_data):
         loss_fn = lpips.LPIPS(net="vgg").to(x0_data.device)

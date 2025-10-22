@@ -47,7 +47,7 @@ class RBFNetwork(pl.LightningModule):
                 ).view(all_data.shape[0], -1)
 
                 if len(all_data.shape) > 2:
-                    all_data = all_data.view(all_data.shape[0], -1)
+                    all_data = all_data.reshape(all_data.shape[0], -1)
             else:
                 batch = next(iter(self.trainer.datamodule.train_dataloader()))
                 metric_samples_batch_filtered = [
