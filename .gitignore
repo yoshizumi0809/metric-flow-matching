@@ -1,0 +1,30 @@
+# ===== training artifacts =====
+# checkpoints (Lightning + あなたの保存先)
+checkpoints/
+**/checkpoints/
+**/*.ckpt
+
+# 生成画像・生成テンソル
+generated_samples/
+**/generated_samples/
+generated_samples/**/*.png
+generated_samples/**/*.pt
+
+# 実験ログ類
+wandb/
+lightning_logs/
+logs/
+
+# 一時ファイル・キャッシュ
+__pycache__/
+*.py[cod]
+*.ipynb_checkpoints
+.DS_Store
+
+# 大きなローカルデータ（必要なら）
+data/
+!data/.gitkeep   # ディレクトリは残したい場合
+
+# VSCode などの環境設定（必要なら）
+.vscode/
+.env

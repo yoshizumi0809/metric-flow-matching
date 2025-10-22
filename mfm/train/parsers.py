@@ -185,7 +185,6 @@ def metric_parser(parser):
         default=64,
         help="Size of the image for metric learning",
     )
-
     return parser
 
 
@@ -221,6 +220,20 @@ def general_training_parser(parser):
         type=int,
         default=1000,
         help="Number of steps in simulation",
+    )
+    # ✅ 追加：任意の実験名（保存系・W&B名に使う想定）
+    parser.add_argument(
+        "--experiment_name",
+        type=str,
+        default=None,
+        help="任意の実験名。保存先(checkpoints, generated_samples, W&B run名)に反映される想定",
+    )
+    # ✅ 既存：Flow のテスト専用フラグ
+    parser.add_argument(
+        "--only_test_flow",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Flowの学習をスキップし、指定ckptでtestのみ実行する",
     )
     return parser
 
