@@ -1,6 +1,8 @@
 import argparse
 import copy
 import os
+import json
+import torch
 
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import WandbLogger
@@ -33,6 +35,42 @@ from mfm.train.train_utils import (
     dataset_name2datapath,
     create_callbacks,
 )
+
+# ============== ckpt と今回の引数の突き合わせユーティリティ ==============
+def warn_if_ckpt_args_mismatch(ckpt_path: str, args_now, label: str = "ckpt"):
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+    except Exception as e:
+        print(f"[WARN] could not open {label} '{ckpt_path}' to compare args: {e}")
+        return
+
+    hp = ckpt.get("hyper_parameters", {})
+    trained_args = None
+    if isinstance(hp, dict):
+        # GeoPath 側では save_hyperparameters() によりここに入っている可能性が高い
+        trained_args = hp.get("args", None)
+
+    keys_to_check = ["data_type", "data_name", "x0_label", "x1_label", "image_size"]
+    print(f"[TEST] comparing current CLI/config vs {label} hparams (if available)")
+    if trained_args is not None and isinstance(trained_args, dict):
+        diffs = []
+        now_line = ", ".join([f"{k}={getattr(args_now, k, None)}" for k in keys_to_check])
+        old_line = ", ".join([f"{k}={trained_args.get(k, None)}" for k in keys_to_check])
+        print(f"[TEST] now : {now_line}")
+        print(f"[TEST] {label}: {old_line}")
+        for k in keys_to_check:
+            old = trained_args.get(k, "<NA>")
+            new = getattr(args_now, k, "<NA>")
+            if old != new:
+                diffs.append((k, old, new))
+        if diffs:
+            print("!!! [WARNING] Mismatch between ckpt(hparams) and current CLI/config:")
+            for k, old, new in diffs:
+                print(f"    - {k}: ckpt='{old}'  vs  now='{new}'")
+            print("    Proceeding with CURRENT CLI/config (datamodule uses 'now').")
+    else:
+        print(f"[TEST] {label} has no saved hyper_parameters.args (ok).")
+# ======================================================================
 
 
 def main(args: argparse.Namespace, seed: int, t_exclude: int) -> None:
@@ -238,6 +276,16 @@ def main(args: argparse.Namespace, seed: int, t_exclude: int) -> None:
     if getattr(args, "only_test_flow", False):
         ckpt_for_test = args.resume_flow_model_ckpt or "last"
         print(f"[INFO] Test-only mode. Flow ckpt = {ckpt_for_test}")
+        # ckpt 内の学習時ハイパラと突き合わせ（Flow / GeoPath の両方）
+        if ckpt_for_test not in ["last", "best", None]:
+            warn_if_ckpt_args_mismatch(ckpt_for_test, args, label="flow_ckpt")
+        if getattr(args, "load_geopath_model_ckpt", None):
+            warn_if_ckpt_args_mismatch(args.load_geopath_model_ckpt, args, label="geopath_ckpt")
+
+        # 参考ログ：今回の引数（datamodule はこれを使う）
+        print(f"[TEST] CURRENT args: x0_label={args.x0_label}, x1_label={args.x1_label}, "
+              f"data_type={args.data_type}, data_name={args.data_name}, image_size={getattr(args, 'image_size', None)}")
+
         trainer.test(flow_train, datamodule=datamodule, ckpt_path=ckpt_for_test)
     else:
         trainer.fit(
