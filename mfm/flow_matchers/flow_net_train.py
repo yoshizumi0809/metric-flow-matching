@@ -1,6 +1,7 @@
 # mfm/flow_matchers/flow_net_train.py
 
 import os
+import json
 import torch
 import wandb
 import matplotlib.pyplot as plt
@@ -20,7 +21,7 @@ from mfm.utils import wasserstein_distance, plot_arch, plot_lidar, plot_sphere
 from mfm.flow_matchers.ema import EMA
 from mfm.flow_matchers.eval_utils import FIDImageDataset
 
-
+# ……（中略：FlowNetTrainBase / FlowNetTrainTrajectory / FlowNetTrainLidar は元のまま）……
 class FlowNetTrainBase(pl.LightningModule):
     def __init__(
         self,
@@ -246,6 +247,11 @@ class FlowNetTrainLidar(FlowNetTrainBase):
 
 class FlowNetTrainImage(FlowNetTrainBase):
     def on_test_start(self):
+        # 今回の引数の可視化
+        print(f"[TEST] Using CURRENT args: "
+              f"x0_label={self.args.x0_label}, x1_label={self.args.x1_label}, "
+              f"data_name={getattr(self.args,'data_name',None)}, image_size={getattr(self.args,'image_size',None)}")
+
         # ODE 準備
         self.node = NeuralODE(
             flow_model_torch_wrapper(self.flow_net).to(self.device),
@@ -265,6 +271,11 @@ class FlowNetTrainImage(FlowNetTrainBase):
         )
         self.ambient_x1 = self.trainer.datamodule.ambient_x1
 
+        print(f"[TEST] ambient_x0: shape={tuple(self.ambient_x0.shape)}, "
+              f"min={float(self.ambient_x0.min())}, max={float(self.ambient_x0.max())}")
+        print(f"[TEST] ambient_x1: shape={tuple(self.ambient_x1.shape)}, "
+              f"min={float(self.ambient_x1.min())}, max={float(self.ambient_x1.max())}")
+
         # ===== 保存ディレクトリ: generated_samples/<experiment_name> に固定 =====
         exp_name = getattr(self.args, "experiment_name", None)
         if not exp_name or len(str(exp_name)) == 0:
@@ -281,6 +292,12 @@ class FlowNetTrainImage(FlowNetTrainBase):
         if self.global_rank == 0:
             os.makedirs(self.sample_dir, exist_ok=True)
             self.print(f"[FlowNetTest] Saving samples to: {self.sample_dir}")
+            # 今回の引数を証跡として保存
+            try:
+                with open(os.path.join(self.sample_dir, "args_test.json"), "w") as f:
+                    json.dump(vars(self.args), f, indent=2)
+            except Exception as e:
+                print(f"[WARN] could not write args_test.json: {e}")
 
     def _to_01(self, x_minus1_to_1: torch.Tensor) -> torch.Tensor:
         """[-1,1] -> [0,1]"""
@@ -305,12 +322,12 @@ class FlowNetTrainImage(FlowNetTrainBase):
         if self.global_rank == 0:
             imgs_01 = self._to_01(output)  # [-1,1] → [0,1]
 
-            # 個別PNG（従来名に回帰）
+            # 個別PNG（従来名）
             for i in range(imgs_01.size(0)):
                 fname = f"sample_b{batch_idx:04d}_{i:03d}.png"
                 save_image(imgs_01[i], os.path.join(self.sample_dir, fname))
 
-            # グリッドPNG（従来名に回帰）
+            # グリッドPNG（従来名）
             grid_name = f"grid_b{batch_idx:04d}.png"
             save_image(imgs_01, os.path.join(self.sample_dir, grid_name), nrow=min(8, imgs_01.size(0)))
 
@@ -329,7 +346,7 @@ class FlowNetTrainImage(FlowNetTrainBase):
         self.log("FID", fid, on_step=False, on_epoch=True, prog_bar=True)
         self.log("LPIPS", lpips_val, on_step=False, on_epoch=True, prog_bar=True)
 
-        # ===== まとめて保存（rank 0 のみ、従来名に回帰）=====
+        # ===== まとめて保存（rank 0 のみ）=====
         if self.global_rank == 0:
             imgs_01_all = self._to_01(all_outputs)
             save_image(imgs_01_all, os.path.join(self.sample_dir, "samples_all_grid.png"), nrow=8)
