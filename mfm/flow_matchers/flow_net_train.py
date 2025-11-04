@@ -9,7 +9,6 @@ from torch.optim import AdamW
 from torchmetrics.functional import mean_squared_error
 from torchdyn.core import NeuralODE
 from torchvision import transforms
-from torchvision.utils import save_image  # 画像保存
 
 import lpips
 from fld.features.InceptionFeatureExtractor import InceptionFeatureExtractor
@@ -289,30 +288,79 @@ class FlowNetTrainImage(FlowNetTrainBase):
     def test_step(self, batch, batch_idx):
         # ===== 生成 =====
         with torch.no_grad():
-            traj = self.node.trajectory(
-                batch.to(self.device),
-                t_span=torch.linspace(0, 1, 100).to(self.device),
-            )
+            # 高分解能で軌跡を取り、その中から等間隔サンプルを可視化
+            t_dense = torch.linspace(0, 1, 100).to(self.device)
+            traj = self.node.trajectory(batch.to(self.device), t_span=t_dense)
+        # [T, B, C, H, W] -> [B, T, C, H, W]
         traj = traj.transpose(0, 1)
-        traj = traj.reshape(*traj.shape[0:2], *self.trainer.datamodule.dim)
-        output_latent = traj[:, -1]
 
-        # VAE で画像に復元（CPUへ）
-        output = self.vae.decode(output_latent).sample.cpu().detach()
-        self.all_outputs.append(output)
+        # ===== 可視化設定 =====
+        # 列: t = 0, 0.2, 0.4, 0.6, 0.8, 1.0
+        t_vals = torch.tensor([0.0, 0.2, 0.4, 0.6, 0.8, 1.0], device=self.device)
+        # 近いインデックスに丸め
+        col_indices = torch.round(t_vals * (t_dense.numel() - 1)).long().tolist()
+        n_cols = len(col_indices)
 
-        # ===== 保存（rank 0 のみ）=====
+        # 行: 1行目= t 表示、2〜5行目= 4枚のサンプルの遷移
+        n_rows_images = 4
+        n_rows_total = 1 + n_rows_images
+        n_show = min(n_rows_images, traj.size(0))  # バッチが小さいときも安全
+
+        # 選択する latent をまとめてデコード（高速化）
+        # 形: [n_show, n_cols, C, H, W] を一括 decode
+        latents_sel = torch.stack(
+            [traj[i, col_indices, ...] for i in range(n_show)], dim=0
+        )  # [n_show, n_cols, C, H, W]
+        flat_latents = latents_sel.reshape(n_show * n_cols, *latents_sel.shape[2:])
+        decoded = self.vae.decode(flat_latents).sample.cpu().detach()  # [-1,1]
+        imgs_01 = self._to_01(decoded)  # [0,1]
+        # 形を [n_show, n_cols, 3, H, W] に戻す
+        imgs_01 = imgs_01.reshape(n_show, n_cols, *imgs_01.shape[1:])
+
+        # ===== パネル描画（1行目にt、2〜5行目に各サンプルの遷移）=====
         if self.global_rank == 0:
-            imgs_01 = self._to_01(output)  # [-1,1] → [0,1]
+            fig_w = n_cols * 2.2
+            fig_h = n_rows_total * 2.2
+            fig, axes = plt.subplots(n_rows_total, n_cols, figsize=(fig_w, fig_h))
 
-            # 個別PNG（従来名に回帰）
-            for i in range(imgs_01.size(0)):
-                fname = f"sample_b{batch_idx:04d}_{i:03d}.png"
-                save_image(imgs_01[i], os.path.join(self.sample_dir, fname))
+            # 1行目: t の値だけを中央に表示（白背景）
+            for j in range(n_cols):
+                ax = axes[0, j] if n_cols > 1 else axes[0]
+                ax.axis("off")
+                ax.set_facecolor("white")
+                ax.text(
+                    0.5,
+                    0.5,
+                    f"t={t_vals[j].item():.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=12,
+                    fontweight="bold",
+                )
 
-            # グリッドPNG（従来名に回帰）
-            grid_name = f"grid_b{batch_idx:04d}.png"
-            save_image(imgs_01, os.path.join(self.sample_dir, grid_name), nrow=min(8, imgs_01.size(0)))
+            # 2〜5行目: 画像を配置
+            for i in range(n_show):
+                for j in range(n_cols):
+                    ax = axes[1 + i, j] if n_cols > 1 else axes[1 + i]
+                    img = imgs_01[i, j]
+                    # [C,H,W] -> [H,W,C]
+                    ax.imshow(img.permute(1, 2, 0).numpy())
+                    ax.axis("off")
+
+            plt.tight_layout()
+            # 保存
+            out_path = os.path.join(
+                self.sample_dir, f"transition_panel_b{batch_idx:04d}.png"
+            )
+            plt.savefig(out_path, dpi=200)
+            wandb.log({f"transition_panel/b{batch_idx:04d}": wandb.Image(plt)})
+            plt.close(fig)
+
+        # 生成物は評価用に保持（FID/LPIPS用）
+        # ※ t=1 のみを all_outputs に追加（評価は最終出力で行う）
+        final_latent = traj[:, col_indices[-1], ...]
+        output = self.vae.decode(final_latent).sample.cpu().detach()
+        self.all_outputs.append(output)
 
     def on_test_epoch_end(self):
         # ===== 評価 =====
@@ -324,16 +372,14 @@ class FlowNetTrainImage(FlowNetTrainBase):
             FIDImageDataset(x1_cpu, self.postprocess),
             FIDImageDataset(all_outputs, self.postprocess),
         )
-        lpips_val = self.compute_lpips(self._prep_for_lpips(x0_cpu), self._prep_for_lpips(all_outputs))
+        lpips_val = self.compute_lpips(
+            self._prep_for_lpips(x0_cpu), self._prep_for_lpips(all_outputs)
+        )
 
         self.log("FID", fid, on_step=False, on_epoch=True, prog_bar=True)
         self.log("LPIPS", lpips_val, on_step=False, on_epoch=True, prog_bar=True)
 
-        # ===== まとめて保存（rank 0 のみ、従来名に回帰）=====
-        if self.global_rank == 0:
-            imgs_01_all = self._to_01(all_outputs)
-            save_image(imgs_01_all, os.path.join(self.sample_dir, "samples_all_grid.png"), nrow=8)
-            torch.save(all_outputs, os.path.join(self.sample_dir, "samples_all.pt"))
+        # ★ 要望に合わせて、ここでは追加の画像保存（グリッド/個別）は行わない
 
     def _prep_for_lpips(self, x: torch.Tensor) -> torch.Tensor:
         x = x.float()
