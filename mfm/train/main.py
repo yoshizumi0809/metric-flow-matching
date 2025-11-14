@@ -1,7 +1,10 @@
 import argparse
 import copy
 import os
+os.environ["WANDB_MODE"] = "offline"
+os.environ["WANDB_SILENT"] = "true"
 
+import torch
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import WandbLogger
 import wandb

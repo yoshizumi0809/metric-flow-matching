@@ -222,16 +222,22 @@ class ImageDataModule(pl.LightningDataModule):
         #   （必要に応じて cat([train_x0, train_x1, train_wild]) でも可）
         self.all_data = self.data_train["pixel"]
 
-        # 低解像度可視化用（存在しないラベルを参照しないよう guard）
+        # ===== 修正: 低解像度可視化用データの準備 =====
         # x0
-        if self.x0_label in LABELS_MAP[self.data_name]:
+        if self.x0_label == "gaussian":
+            # 可視化用の低解像度ノイズも生成
+            N_ambient = self.ambient_train["mean"].shape[0]
+            print(f"[INFO] Generating ambient gaussian noise for visualization: {N_ambient} samples")
+            self.ambient_x0 = torch.sigmoid(torch.randn(N_ambient, 3, 64, 64))
+        elif self.x0_label in LABELS_MAP[self.data_name]:
             self.ambient_x0 = self.ambient_train["mean"][
                 self.ambient_train["label"] == LABELS_MAP[self.data_name][self.x0_label]
             ]
         else:
-            # gaussian の場合など、可視化で使うならランダムに作ってもよいが、
-            # ここでは None にして Flow 側で使わない前提にする
+            # その他の予期しないケース
+            print(f"[WARNING] Unexpected x0_label: {self.x0_label}, setting ambient_x0 to None")
             self.ambient_x0 = None
+        
         # x1
         self.ambient_x1 = self.ambient_train["mean"][
             self.ambient_train["label"] == LABELS_MAP[self.data_name][self.x1_label]
