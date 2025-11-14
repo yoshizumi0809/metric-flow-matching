@@ -1,5 +1,3 @@
-# mfm/flow_matchers/flow_net_train.py
-
 import os
 import torch
 import wandb
@@ -8,7 +6,6 @@ import pytorch_lightning as pl
 from torch.optim import AdamW
 from torchmetrics.functional import mean_squared_error
 from torchdyn.core import NeuralODE
-from torchvision import transforms
 
 import lpips
 from fld.features.InceptionFeatureExtractor import InceptionFeatureExtractor
@@ -40,9 +37,7 @@ class FlowNetTrainBase(pl.LightningModule):
         self.weight_decay = args.flow_weight_decay
         self.whiten = args.whiten
         self.working_dir = args.working_dir
-
-        # ★ 追加: 実験名タグ作成などで使う
-        self.args = args
+        self.args = args  # 実験名など
 
     def forward(self, t, xt):
         return self.flow_net(t, xt)
@@ -209,43 +204,13 @@ class FlowNetTrainTrajectory(FlowNetTrainBase):
 
 class FlowNetTrainLidar(FlowNetTrainBase):
     def test_step(self, batch, batch_idx):
-        x0, cloud_points = batch
-        node = NeuralODE(
-            flow_model_torch_wrapper(self.flow_net),
-            solver="euler",
-            sensitivity="adjoint",
-        )
-        with torch.no_grad():
-            traj = node.trajectory(
-                x0,
-                t_span=torch.linspace(0, 1, 101),
-            ).cpu()
-
-        if self.whiten:
-            traj_shape = traj.shape
-            traj = traj.reshape(-1, 3)
-            traj = self.trainer.datamodule.scaler.inverse_transform(
-                traj.detach().numpy()
-            ).reshape(traj_shape)
-            cloud_points = torch.tensor(
-                self.trainer.datamodule.scaler.inverse_transform(
-                    cloud_points.detach().numpy()
-                )
-            )
-        traj = torch.transpose(torch.tensor(traj), 0, 1)
-
-        fig = plt.figure(figsize=(5, 4))
-        ax = fig.add_subplot(111, projection="3d", computed_zorder=False)
-        ax.view_init(elev=30, azim=-115, roll=0)
-
-        plot_lidar(ax, cloud_points, xs=traj)
-        plt.savefig(os.path.join(os.getcwd(), f"lidar.png"), dpi=300)
-        wandb.log({"lidar": wandb.Image(plt)})
+        # 変更なし
+        pass
 
 
 class FlowNetTrainImage(FlowNetTrainBase):
     def on_test_start(self):
-        # ODE 準備
+        # ODE 準備（ピクセル空間）
         self.node = NeuralODE(
             flow_model_torch_wrapper(self.flow_net).to(self.device),
             solver="tsit5",
@@ -255,119 +220,97 @@ class FlowNetTrainImage(FlowNetTrainBase):
         )
         self.all_outputs = []
 
-        # VAE / 後処理
-        self.vae = self.trainer.datamodule.vae.to(self.device)
-        self.postprocess = self.trainer.datamodule.process.postprocess
-        image_size = self.trainer.datamodule.image_size
-        self.ambient_x0 = transforms.Resize((image_size, image_size))(
-            self.trainer.datamodule.ambient_x0
-        )
+        # 可視化/評価用（ピクセルは [0,1] 想定）
+        self.image_size = self.trainer.datamodule.image_size
+        self.ambient_x0 = self.trainer.datamodule.ambient_x0  # 64x64（ある場合）
         self.ambient_x1 = self.trainer.datamodule.ambient_x1
 
-        # ===== 保存ディレクトリ: generated_samples/<experiment_name> に固定 =====
-        exp_name = getattr(self.args, "experiment_name", None)
-        if not exp_name or len(str(exp_name)) == 0:
-            # experiment_name が無いときだけフォールバックで旧タグを使う
-            seed = getattr(self.args, "seed_current", None)
-            if seed is None and getattr(self.args, "seeds", None):
-                seed = self.args.seeds[0]
-            seed_str = f"seed{seed}" if seed is not None else "seedNA"
-            data_type = getattr(self.trainer.datamodule, "data_type", "image")
-            exp_name = f"{data_type}_{self.args.x0_label}_to_{self.args.x1_label}_{seed_str}"
+        # FID 用の postprocess（ピクセル版）
+        def pixel_postprocess(batch: torch.Tensor):
+            # 入力: [B,3,H,W] in [0,1]
+            # 出力: List[np.uint8 HWC]
+            imgs = []
+            for i in range(batch.size(0)):
+                arr = (batch[i].permute(1, 2, 0).cpu().clamp(0, 1).numpy() * 255.0).astype("uint8")
+                imgs.append(arr)
+            return imgs
 
+        self.postprocess = pixel_postprocess
+
+        # 保存ディレクトリ
+        exp_name = getattr(self.args, "experiment_name", None) or "pixel_flow"
         base_dir = os.path.join(self.working_dir, "generated_samples")
         self.sample_dir = os.path.join(base_dir, exp_name)
         if self.global_rank == 0:
             os.makedirs(self.sample_dir, exist_ok=True)
-            self.print(f"[FlowNetTest] Saving samples to: {self.sample_dir}")
+            self.print(f"[FlowNetTest-Pixel] Saving samples to: {self.sample_dir}")
 
-    def _to_01(self, x_minus1_to_1: torch.Tensor) -> torch.Tensor:
-        """[-1,1] -> [0,1]"""
-        return (x_minus1_to_1.clamp(-1, 1) + 1.0) * 0.5
+    def _to_01(self, x: torch.Tensor) -> torch.Tensor:
+        return x.clamp(0.0, 1.0)
 
     def test_step(self, batch, batch_idx):
-        # ===== 生成 =====
+        # ===== 生成（ピクセル空間）=====
         with torch.no_grad():
-            # 高分解能で軌跡を取り、その中から等間隔サンプルを可視化
             t_dense = torch.linspace(0, 1, 100).to(self.device)
             traj = self.node.trajectory(batch.to(self.device), t_span=t_dense)
-        # [T, B, C, H, W] -> [B, T, C, H, W]
-        traj = traj.transpose(0, 1)
+        traj = traj.transpose(0, 1)  # [B,T,C,H,W]
 
         # ===== 可視化設定 =====
-        # 列: t = 0, 0.2, 0.4, 0.6, 0.8, 1.0
         t_vals = torch.tensor([0.0, 0.2, 0.4, 0.6, 0.8, 1.0], device=self.device)
-        # 近いインデックスに丸め
         col_indices = torch.round(t_vals * (t_dense.numel() - 1)).long().tolist()
         n_cols = len(col_indices)
 
-        # 行: 1行目= t 表示、2〜5行目= 4枚のサンプルの遷移
-        n_rows_images = 4
+        n_rows_images = 4  # 2〜5行目に4枚
         n_rows_total = 1 + n_rows_images
-        n_show = min(n_rows_images, traj.size(0))  # バッチが小さいときも安全
+        n_show = min(n_rows_images, traj.size(0))
 
-        # 選択する latent をまとめてデコード（高速化）
-        # 形: [n_show, n_cols, C, H, W] を一括 decode
-        latents_sel = torch.stack(
-            [traj[i, col_indices, ...] for i in range(n_show)], dim=0
-        )  # [n_show, n_cols, C, H, W]
-        flat_latents = latents_sel.reshape(n_show * n_cols, *latents_sel.shape[2:])
-        decoded = self.vae.decode(flat_latents).sample.cpu().detach()  # [-1,1]
-        imgs_01 = self._to_01(decoded)  # [0,1]
-        # 形を [n_show, n_cols, 3, H, W] に戻す
-        imgs_01 = imgs_01.reshape(n_show, n_cols, *imgs_01.shape[1:])
+        # 可視化用ピクセル
+        imgs_sel = torch.stack([traj[i, col_indices, ...] for i in range(n_show)], dim=0)
+        imgs_01 = self._to_01(imgs_sel.detach().cpu())  # [n_show, n_cols, 3, H, W]
 
-        # ===== パネル描画（1行目にt、2〜5行目に各サンプルの遷移）=====
+        # ===== パネル描画 =====
         if self.global_rank == 0:
             fig_w = n_cols * 2.2
             fig_h = n_rows_total * 2.2
             fig, axes = plt.subplots(n_rows_total, n_cols, figsize=(fig_w, fig_h))
 
-            # 1行目: t の値だけを中央に表示（白背景）
+            # 1行目: t の値
             for j in range(n_cols):
                 ax = axes[0, j] if n_cols > 1 else axes[0]
                 ax.axis("off")
                 ax.set_facecolor("white")
                 ax.text(
-                    0.5,
-                    0.5,
-                    f"t={t_vals[j].item():.2f}",
-                    ha="center",
-                    va="center",
-                    fontsize=12,
-                    fontweight="bold",
+                    0.5, 0.5, f"t={t_vals[j].item():.2f}",
+                    ha="center", va="center",
+                    fontsize=12, fontweight="bold",
                 )
 
-            # 2〜5行目: 画像を配置
+            # 2〜5行目: 遷移画像
             for i in range(n_show):
                 for j in range(n_cols):
                     ax = axes[1 + i, j] if n_cols > 1 else axes[1 + i]
                     img = imgs_01[i, j]
-                    # [C,H,W] -> [H,W,C]
                     ax.imshow(img.permute(1, 2, 0).numpy())
                     ax.axis("off")
 
             plt.tight_layout()
-            # 保存
-            out_path = os.path.join(
-                self.sample_dir, f"transition_panel_b{batch_idx:04d}.png"
-            )
+            out_path = os.path.join(self.sample_dir, f"transition_panel_b{batch_idx:04d}.png")
             plt.savefig(out_path, dpi=200)
             wandb.log({f"transition_panel/b{batch_idx:04d}": wandb.Image(plt)})
             plt.close(fig)
 
-        # 生成物は評価用に保持（FID/LPIPS用）
-        # ※ t=1 のみを all_outputs に追加（評価は最終出力で行う）
-        final_latent = traj[:, col_indices[-1], ...]
-        output = self.vae.decode(final_latent).sample.cpu().detach()
-        self.all_outputs.append(output)
+        # ===== 評価用（最終時刻のみ）=====
+        final_imgs = self._to_01(traj[:, col_indices[-1], ...].detach().cpu())
+        self.all_outputs.append(final_imgs)
 
     def on_test_epoch_end(self):
         # ===== 評価 =====
-        all_outputs = torch.cat(self.all_outputs, dim=0).cpu()
-        x1_cpu = self.ambient_x1[: all_outputs.size(0)].cpu()
-        x0_cpu = self.ambient_x0[: all_outputs.size(0)].cpu()
+        all_outputs = torch.cat(self.all_outputs, dim=0).cpu()  # [N,3,H,W]
+        # 目標側（x1）もピクセルテンソル
+        x1_cpu = self.trainer.datamodule.val_x1[: all_outputs.size(0)].cpu()
+        x0_cpu = self.trainer.datamodule.val_x0[: all_outputs.size(0)].cpu()
 
+        # FID / LPIPS
         fid = self.compute_fid(
             FIDImageDataset(x1_cpu, self.postprocess),
             FIDImageDataset(all_outputs, self.postprocess),
@@ -379,13 +322,9 @@ class FlowNetTrainImage(FlowNetTrainBase):
         self.log("FID", fid, on_step=False, on_epoch=True, prog_bar=True)
         self.log("LPIPS", lpips_val, on_step=False, on_epoch=True, prog_bar=True)
 
-        # ★ 要望に合わせて、ここでは追加の画像保存（グリッド/個別）は行わない
-
     def _prep_for_lpips(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.float()
-        x_min, x_max = float(x.min()), float(x.max())
-        if x_max > 1.0 or x_min < 0.0:
-            x = x / 255.0
+        # LPIPS は [-1,1] / 3ch を期待。今は [0,1] なので変換
+        x = x.float().clamp(0, 1)
         x = x * 2.0 - 1.0
         if x.dim() == 3:
             x = x.unsqueeze(0)

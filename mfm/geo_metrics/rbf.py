@@ -27,67 +27,161 @@ class RBFNetwork(pl.LightningModule):
         self.datamodule = datamodule
         self.image_data = image_data
 
+        # バッファ（学習後もデバイス追従）
+        self.register_buffer("C", torch.empty(0))       # [K,D]
+        self.register_buffer("lamda", torch.empty(0))   # [K,1]
+        self.register_buffer("sigmas", torch.empty(0))  # [K,1]
+
     def on_before_zero_grad(self, *args, **kwargs):
         self.W.data = torch.clamp(self.W.data, min=0.0001)
 
+    @torch.no_grad()
+    def _compute_centroids_torch(self, all_data: torch.Tensor, labels: np.ndarray, K: int) -> torch.Tensor:
+        """labels(np.ndarray) に基づいて all_data(torch [N,D]) のクラスタ中心を torch で計算"""
+        N, D = all_data.shape
+        C = torch.zeros(K, D, dtype=all_data.dtype, device=all_data.device)
+        labels_t = torch.from_numpy(labels).to(all_data.device)
+        for k in range(K):
+            idx = (labels_t == k)
+            if idx.any():
+                pts = all_data[idx, :]
+                C[k] = pts.mean(dim=0)
+            else:
+                C[k] = 0.0
+        return C
+
+    def _concat_flat(self, t0: torch.Tensor, t1: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([t0, t1])
+        if x.ndim > 2:
+            x = x.reshape(x.shape[0], -1)
+        return x
+
+    def _dedup_with_indices(self, X_np: np.ndarray):
+        """np.unique で完全一致行を一意化。保持する行の昇順インデックスを返す。"""
+        _, keep_idx = np.unique(X_np, axis=0, return_index=True)
+        keep_idx.sort()  # 元の順序を保つ
+        return keep_idx
+
     def on_train_start(self):
         with torch.no_grad():
+            # ---- データ準備（結合 → フラット化）----
             if self.image_data:
-                all_data = torch.cat(
-                    [
-                        self.datamodule.train_x0,
-                        self.datamodule.train_x1,
-                    ]
-                )
-                data_to_fit = torch.cat(
-                    [
-                        self.datamodule.ambient_x0,
-                        self.datamodule.ambient_x1,
-                    ]
-                ).view(all_data.shape[0], -1)
+                # all_data: 高解像ピクセル側（クラスタ中心/σ用）
+                all_data = self._concat_flat(self.datamodule.train_x0, self.datamodule.train_x1)
 
-                if len(all_data.shape) > 2:
-                    all_data = all_data.reshape(all_data.shape[0], -1)
+                # data_to_fit: 低解像（ambient）側（KMeans用）
+                ambient = self._concat_flat(self.datamodule.ambient_x0, self.datamodule.ambient_x1)
+                data_to_fit = ambient.cpu().numpy().astype(np.float32, copy=False)
             else:
                 batch = next(iter(self.trainer.datamodule.train_dataloader()))
                 metric_samples_batch_filtered = [
-                    x
-                    for i, x in enumerate(batch[0]["metric_samples"][0])
+                    x for i, x in enumerate(batch[0]["metric_samples"][0])
                     if i in [self.current_timestep, self.next_timestep]
                 ]
                 all_data = torch.cat(metric_samples_batch_filtered)
-                data_to_fit = all_data
+                if all_data.ndim > 2:
+                    all_data = all_data.reshape(all_data.shape[0], -1)
+                data_to_fit = all_data.cpu().numpy().astype(np.float32, copy=False)
 
+            # ---- 重複除去（x0∪x1 の完全一致サンプルを全て削除）----
+            keep_idx = self._dedup_with_indices(data_to_fit)
+            n_before = data_to_fit.shape[0]
+            if len(keep_idx) < n_before:
+                print(f"[RBF] dedup: removed {n_before - len(keep_idx)} duplicates; N: {n_before} -> {len(keep_idx)}")
+                # data_to_fit (numpy) に適用
+                data_to_fit = data_to_fit[keep_idx]
+                # all_data (torch) にも同じインデックスを適用（順序対応を仮定）
+                idx_t = torch.from_numpy(keep_idx).to(all_data.device)
+                all_data = all_data.index_select(0, idx_t)
+
+            # ---- KMeans（K > N の場合は自動縮小）----
+            n_unique = data_to_fit.shape[0]
+            if self.K > n_unique:
+                oldK = self.K
+                self.K = int(n_unique)
+                print(f"[RBF] shrink K due to dedup: {oldK} -> {self.K}")
+            # 再構築（K が変わった可能性に対応）
+            self.clustering_model = KMeans(n_clusters=self.K)
             print("Fitting Clustering model...")
             self.clustering_model.fit(data_to_fit)
 
-            clusters = (
-                self.calculate_centroids(all_data, self.clustering_model.labels_)
-                if self.image_data
-                else self.clustering_model.cluster_centers_
-            )
-
-            self.C = torch.tensor(clusters, dtype=torch.float32).to(self.device)
             labels = self.clustering_model.labels_
-            sigmas = np.zeros((self.K, 1))
+            counts = np.bincount(labels, minlength=self.K)
+            empty_clusters = int((counts == 0).sum())
+            singletons = int((counts == 1).sum())
+            print(f"[RBF] KMeans fit: N={len(labels)}, D={data_to_fit.shape[1]}, K={self.K}")
+            print(f"[RBF] After fit: K={self.K}, assigned={len(labels)}, "
+                  f"min_cluster_size={counts.min()}, max_cluster_size={counts.max()}, "
+                  f"empty_clusters={empty_clusters}, singleton_clusters={singletons}")
 
+            # ---- クラスタ中心（pixel は torch で再計算）----
+            all_data = all_data.to(self.device, non_blocking=True)
+            if self.image_data:
+                C = self._compute_centroids_torch(all_data, labels, self.K)
+            else:
+                C = torch.tensor(self.clustering_model.cluster_centers_, dtype=torch.float32, device=self.device)
+
+            # ---- σ_k 計算（分散0検出）----
+            sigmas = torch.zeros(self.K, 1, dtype=torch.float32, device=self.device)
+            labels_t = torch.from_numpy(labels).to(all_data.device)
+            zero_var_points_total = 0
             for k in range(self.K):
-                points = all_data[labels == k, :]
-                variance = ((points - clusters[k]) ** 2).mean(axis=0)
-                sigmas[k, :] = np.sqrt(
-                    variance.sum() if self.image_data else variance.mean()
-                )
+                idx = (labels_t == k)
+                if not idx.any():
+                    sigmas[k, 0] = 0.0
+                    continue
+                pts = all_data[idx, :]  # [n_k, D]
+                var_dim = ((pts - C[k]) ** 2).mean(dim=0)
+                sigma_k = torch.sqrt(var_dim.sum() if self.image_data else var_dim.mean())
+                sigmas[k, 0] = sigma_k
+                if sigma_k.item() == 0.0:
+                    zero_var_points_total += int(counts[k])
 
-            self.lamda = torch.tensor(
-                0.5 / (self.kappa * sigmas) ** 2, dtype=torch.float32
-            ).to(self.device)
+            # ---- λ_k = 0.5 / (κ σ_k)^2 ----
+            lamda = torch.empty_like(sigmas)
+            nonzero_mask = (sigmas.squeeze(1) > 0)
+            lamda[nonzero_mask, 0] = 0.5 / (self.kappa * sigmas[nonzero_mask, 0]) ** 2
+            lamda[~nonzero_mask, 0] = torch.inf  # 後で除去
+
+            nonfinite_lambda = int(torch.isfinite(lamda).logical_not().sum().item())
+            lamda_min = float(torch.where(torch.isfinite(lamda), lamda, torch.tensor(float('inf'), device=lamda.device)).min().item())
+            print(f"[RBF] sigma: min={float(sigmas.min().item())}, max={float(sigmas.max().item())} | "
+                  f"lambda: min={lamda_min}, max={'inf' if nonfinite_lambda>0 else float(lamda.max().item())}, "
+                  f"nonfinite_lambda={nonfinite_lambda}")
+
+            zero_idx = (sigmas.squeeze(1) == 0.0).nonzero(as_tuple=False).flatten().cpu().numpy()
+            if zero_idx.size > 0:
+                sizes_str = ", ".join(str(int(s)) for s in counts[zero_idx][: min(10, len(zero_idx))])
+                print(f"[RBF] zero-variance clusters: count={len(zero_idx)}, "
+                      f"total_points={zero_var_points_total}, sizes(first {min(10, len(zero_idx))}): {sizes_str}")
+
+            # ---- 分散ゼロクラスタの完全除去 ----
+            keep_mask = (sigmas.squeeze(1) > 0) & torch.isfinite(lamda.squeeze(1))
+            n_keep = int(keep_mask.sum().item())
+            n_drop = self.K - n_keep
+            if n_keep == 0:
+                raise RuntimeError("[RBF] All clusters have zero variance; cannot proceed.")
+            if n_drop > 0:
+                C = C[keep_mask]
+                lamda = lamda[keep_mask]
+                sigmas = sigmas[keep_mask]
+                self.W = torch.nn.Parameter(torch.rand(n_keep, 1, device=self.device))
+                print(f"[RBF] removed {n_drop} zero-variance clusters; K: {self.K} -> {n_keep}")
+                self.K = n_keep
+
+            # ---- バッファに格納 ----
+            self.C = C
+            self.lamda = lamda
+            self.sigmas = sigmas
 
     def forward(self, x):
-        if len(x.shape) > 2:
+        dev = self.C.device
+        if x.ndim > 2:
             x = x.reshape(x.shape[0], -1)
-        dist2 = torch.cdist(x, self.C) ** 2
-        self.phi_x = torch.exp(-0.5 * self.lamda[None, :, :] * dist2[:, :, None])
-        h_x = (self.W.to(x.device) * self.phi_x).sum(dim=1)
+        x = x.to(dev, non_blocking=True)
+        dist2 = torch.cdist(x, self.C) ** 2  # [B,K]
+        phi_x = torch.exp(-0.5 * self.lamda[None, :, :] * dist2[:, :, None])  # [B,K,1]
+        h_x = (self.W.to(dev) * phi_x).sum(dim=1)  # [B,1]
         return h_x
 
     def training_step(self, batch, batch_idx):
@@ -122,31 +216,22 @@ class RBFNetwork(pl.LightningModule):
         self.log(
             "MetricModel/val_loss_learn_metric",
             loss,
-            on_step=True,
+            on_step=False,
             on_epoch=True,
             prog_bar=True,
         )
         self.last_val_loss = loss.detach()
         return loss
 
-    def calculate_centroids(self, all_data, labels):
-        unique_labels = np.unique(labels)
-        centroids = np.zeros((len(unique_labels), all_data.shape[1]))
-        for i, label in enumerate(unique_labels):
-            centroids[i] = all_data[labels == label].mean(axis=0)
-        return centroids
-
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        return optimizer
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
 
     def compute_metric(self, x, alpha=1, epsilon=1e-2, image_hx=False):
-        if epsilon < 0:
-            epsilon = (1 - self.last_val_loss.item()) / abs(epsilon)
         h_x = self.forward(x)
         if image_hx:
             h_x = 1 - torch.abs(1 - h_x)
             M_x = 1 / (h_x**alpha + epsilon)
         else:
             M_x = 1 / (h_x + epsilon) ** alpha
-        return M_x
+        # ★ここを追加（数値は同じ、デバイスだけ揃える）
+        return M_x.to(x.device, non_blocking=True)

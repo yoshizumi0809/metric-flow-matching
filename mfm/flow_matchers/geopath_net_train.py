@@ -1,3 +1,5 @@
+# mfm/flow_matchers/geopath_net_train.py
+
 import torch
 import pytorch_lightning as pl
 
@@ -24,7 +26,9 @@ class GeoPathNetTrain(pl.LightningModule):
         self.weight_decay = args.geopath_weight_decay
         self.args = args
         self.data_manifold_metric = data_manifold_metric
-        self.multiply_validation = 4
+
+        # ★ 画像データでは複製でバッチを水増ししない（OOM回避）
+        self.multiply_validation = 1 if getattr(args, "data_type", "") == "image" else 4
 
         self.first_loss = None
         self.timesteps = None
@@ -99,7 +103,6 @@ class GeoPathNetTrain(pl.LightningModule):
             velocities.append(vel)
 
         if len(velocities) == 0:
-            # すべて重複で全スキップになったケースでも安全に動作
             self.log(
                 "GeoPathNet/all_pairs_skipped",
                 1.0,
@@ -122,10 +125,8 @@ class GeoPathNetTrain(pl.LightningModule):
     @staticmethod
     def _equal_mask(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
         """サンプル次元以外が完全一致しているかのマスク"""
-        # 形状: (B, ...)
         reduce_dims = tuple(range(1, x0.ndim))
         if x0.dtype.is_floating_point:
-            # 完全一致のみを重複と見なす（数値誤差での誤検出を避ける）
             diff = (x0 - x1).abs()
             return (diff.amax(dim=reduce_dims) == 0)
         else:
@@ -138,10 +139,9 @@ class GeoPathNetTrain(pl.LightningModule):
         for i, (x0, x1) in enumerate(zip(x0s, x1s)):
             x0, x1 = torch.squeeze(x0), torch.squeeze(x1)
 
-            if self.trainer.validating or self.computing_reference_loss:
-                repeat_tuple = (self.multiply_validation, 1) + (1,) * (
-                    len(x0.shape) - 2
-                )
+            # --- Validation / 参照ロス時の複製は、画像データでは行わない ---
+            if (self.trainer.validating or self.computing_reference_loss) and getattr(self.args, "data_type", "") != "image":
+                repeat_tuple = (self.multiply_validation, 1) + (1,) * (len(x0.shape) - 2)
                 x0 = x0.repeat(repeat_tuple)
                 x1 = x1.repeat(repeat_tuple)
 
@@ -161,7 +161,6 @@ class GeoPathNetTrain(pl.LightningModule):
             )
 
             if keep_mask.sum().item() == 0:
-                # すべて重複 → x1 をランダムにシャッフルして再ペア
                 if x1.shape[0] > 1:
                     perm = torch.randperm(x1.shape[0], device=x1.device)
                     x1_shuf = x1[perm]
@@ -170,14 +169,12 @@ class GeoPathNetTrain(pl.LightningModule):
                     if keep_mask.sum().item() > 0:
                         x1 = x1_shuf
                     else:
-                        # それでも全重複ならこのタイムスライスはスキップ
                         if self.skipped_time_points and i + 1 >= self.skipped_time_points[0]:
                             t_start = self.timesteps[i + 2]
                         else:
                             t_start = self.timesteps[i + 1]
                         continue
                 else:
-                    # バッチサイズ1でどうにもならない
                     if self.skipped_time_points and i + 1 >= self.skipped_time_points[0]:
                         t_start = self.timesteps[i + 2]
                     else:
@@ -187,11 +184,23 @@ class GeoPathNetTrain(pl.LightningModule):
             x0 = x0[keep_mask]
             x1 = x1[keep_mask]
 
+            # --- メモリ安全な枚数揃え（repeat禁止）---
+            B0, B1 = x0.shape[0], x1.shape[0]
+            if B0 != B1:
+                if B0 > B1:
+                    idx = torch.randint(0, B1, (B0,), device=x1.device)
+                    x1 = x1[idx]
+                else:
+                    idx = torch.randint(0, B0, (B1,), device=x0.device)
+                    x0 = x0[idx]
+
+            # --- タイムステップ更新 ---
             if self.skipped_time_points and i + 1 >= self.skipped_time_points[0]:
                 t_start_next = self.timesteps[i + 2]
             else:
                 t_start_next = self.timesteps[i + 1]
 
+            # --- サンプリング ---
             t = None
             if self.trainer.validating or self.computing_reference_loss:
                 t = self.t_val[i]
